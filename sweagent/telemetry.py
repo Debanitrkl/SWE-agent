@@ -36,6 +36,7 @@ else:
 _tracer = None
 _conversation_id = None
 _agent_run_context = None  # Store the context with the agent run span
+_agent_run_span = None  # Store the agent run span for explicit parent linking
 
 
 def setup_telemetry(service_name: str = "swe-agent") -> None:
@@ -192,6 +193,11 @@ def trace_agent_step(agent_name: str = "SWE-agent"):
     return decorator
 
 
+def get_agent_run_span():
+    """Get the current agent run span for explicit parent linking."""
+    return _agent_run_span
+
+
 def trace_tool_execution(tool_name: str, tool_call_id: str = None, arguments: dict = None):
     """Context manager to trace tool execution.
     
@@ -210,10 +216,14 @@ def trace_tool_execution(tool_name: str, tool_call_id: str = None, arguments: di
             if tracer is None:
                 return self
             
-            # Start span as child of current context (which should be the agent run)
+            # Get the agent run context to create child span
+            parent_context = _agent_run_context if _agent_run_context else None
+            
+            # Start span as child of agent run context
             self.span = tracer.start_span(
                 f"execute_tool {tool_name}",
-                kind=SpanKind.INTERNAL
+                kind=SpanKind.INTERNAL,
+                context=parent_context
             )
             self.span.set_attribute("gen_ai.operation.name", "execute_tool")
             self.span.set_attribute("gen_ai.tool.name", tool_name)
@@ -276,7 +286,7 @@ class AgentRunTrace:
         self.iterations = 0
     
     def __enter__(self):
-        global _agent_run_context
+        global _agent_run_context, _agent_run_span
         tracer = get_tracer()
         if tracer is None:
             return self
@@ -302,6 +312,7 @@ class AgentRunTrace:
         self.ctx = set_span_in_context(self.span)
         self.token = context.attach(self.ctx)
         _agent_run_context = self.ctx
+        _agent_run_span = self.span  # Store the span globally for child span creation
         
         return self
     
@@ -322,7 +333,7 @@ class AgentRunTrace:
                 self.span.set_attribute("agent.has_submission", True)
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global _agent_run_context
+        global _agent_run_context, _agent_run_span
         if self.span:
             if exc_type is None:
                 self.span.set_status(Status(StatusCode.OK))
@@ -335,6 +346,7 @@ class AgentRunTrace:
             if self.token is not None:
                 context.detach(self.token)
             _agent_run_context = None
+            _agent_run_span = None
             self.span.end()
         return False
 
