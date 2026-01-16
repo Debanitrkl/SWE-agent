@@ -40,7 +40,7 @@ from sweagent.tools.tools import ToolConfig
 from sweagent.types import History, HistoryItem
 from sweagent.utils.log import get_logger
 from sweagent.telemetry import (
-    get_tracer, get_conversation_id, get_current_agent_run, get_agent_run_context, TRACING_ENABLED
+    get_tracer, get_conversation_id, get_current_agent_run, get_agent_run_context, get_current_step_context, TRACING_ENABLED
 )
 if TRACING_ENABLED:
     from opentelemetry.trace import SpanKind, Status, StatusCode
@@ -725,8 +725,8 @@ class LiteLLMModel(AbstractModel):
             from opentelemetry import context as otel_context
             from opentelemetry.trace import set_span_in_context
             
-            # Get parent context from agent run
-            parent_context = get_agent_run_context()
+            # Get parent context - prefer step context, fallback to agent run context
+            parent_context = get_current_step_context() or get_agent_run_context()
             
             span = tracer.start_span(
                 f"chat {self.config.name}",

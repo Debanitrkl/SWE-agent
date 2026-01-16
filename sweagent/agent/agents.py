@@ -57,7 +57,7 @@ from sweagent.utils.log import get_logger
 from sweagent.utils.patch_formatter import PatchFormatter
 from sweagent.telemetry import (
     get_tracer, get_conversation_id, start_agent_run, end_agent_run,
-    trace_tool_execution, TRACING_ENABLED
+    trace_tool_execution, trace_agent_step, TRACING_ENABLED
 )
 
 if TRACING_ENABLED:
@@ -1286,17 +1286,26 @@ class DefaultAgent(AbstractAgent):
 
         n_step = len(self.trajectory) + 1
         self.logger.info("=" * 25 + f" STEP {n_step} " + "=" * 25)
-        step_output = self.forward_with_handling(self.messages)
-        self.add_step_to_history(step_output)
+        
+        # Wrap the step in a trace span for proper hierarchy
+        with trace_agent_step(n_step) as step_trace:
+            step_output = self.forward_with_handling(self.messages)
+            
+            # Set step attributes on the trace
+            if step_trace and hasattr(step_trace, 'set_thought'):
+                step_trace.set_thought(step_output.thought)
+                step_trace.set_action(step_output.action)
+            
+            self.add_step_to_history(step_output)
 
-        self.info["submission"] = step_output.submission
-        self.info["exit_status"] = step_output.exit_status  # type: ignore
-        self.info.update(self._get_edited_files_with_context(patch=step_output.submission or ""))  # type: ignore
-        self.info["model_stats"] = self.model.stats.model_dump()
+            self.info["submission"] = step_output.submission
+            self.info["exit_status"] = step_output.exit_status  # type: ignore
+            self.info.update(self._get_edited_files_with_context(patch=step_output.submission or ""))  # type: ignore
+            self.info["model_stats"] = self.model.stats.model_dump()
 
-        self.add_step_to_trajectory(step_output)
+            self.add_step_to_trajectory(step_output)
 
-        self._chook.on_step_done(step=step_output, info=self.info)
+            self._chook.on_step_done(step=step_output, info=self.info)
         return step_output
 
     def run(

@@ -198,6 +198,83 @@ def get_agent_run_span():
     return _agent_run_span
 
 
+# Global step context for nesting tool spans under step spans
+_current_step_context = None
+_current_step_span = None
+
+
+def get_current_step_context():
+    """Get the current step context for creating child spans."""
+    global _current_step_context
+    return _current_step_context
+
+
+class StepTrace:
+    """Context manager for tracing a single agent step (LLM call + tool execution)."""
+    
+    def __init__(self, step_number: int):
+        self.step_number = step_number
+        self.span = None
+        self.ctx = None
+        self.token = None
+    
+    def __enter__(self):
+        global _current_step_context, _current_step_span
+        tracer = get_tracer()
+        if tracer is None:
+            return self
+        
+        # Get parent context (agent run)
+        parent_context = _agent_run_context if _agent_run_context else None
+        
+        self.span = tracer.start_span(
+            f"agent_step {self.step_number}",
+            kind=SpanKind.INTERNAL,
+            context=parent_context
+        )
+        self.span.set_attribute("gen_ai.operation.name", "agent_step")
+        self.span.set_attribute("agent.step.number", self.step_number)
+        self.span.set_attribute("gen_ai.conversation.id", get_conversation_id())
+        
+        # Set this span as current context for child spans
+        self.ctx = set_span_in_context(self.span)
+        self.token = context.attach(self.ctx)
+        _current_step_context = self.ctx
+        _current_step_span = self.span
+        
+        return self
+    
+    def set_thought(self, thought: str):
+        if self.span and thought:
+            self.span.set_attribute("agent.step.thought", thought[:1000])
+    
+    def set_action(self, action: str):
+        if self.span and action:
+            self.span.set_attribute("agent.step.action", action[:500])
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global _current_step_context, _current_step_span
+        if self.span:
+            if exc_type is None:
+                self.span.set_status(Status(StatusCode.OK))
+            else:
+                self.span.set_attribute("error.type", type(exc_val).__name__)
+                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+                self.span.record_exception(exc_val)
+            
+            if self.token is not None:
+                context.detach(self.token)
+            _current_step_context = None
+            _current_step_span = None
+            self.span.end()
+        return False
+
+
+def trace_agent_step(step_number: int):
+    """Create a step trace context manager."""
+    return StepTrace(step_number)
+
+
 def trace_tool_execution(tool_name: str, tool_call_id: str = None, arguments: dict = None):
     """Context manager to trace tool execution.
     
@@ -216,10 +293,10 @@ def trace_tool_execution(tool_name: str, tool_call_id: str = None, arguments: di
             if tracer is None:
                 return self
             
-            # Get the agent run context to create child span
-            parent_context = _agent_run_context if _agent_run_context else None
+            # Get parent context - prefer step context, fallback to agent run context
+            parent_context = _current_step_context if _current_step_context else (_agent_run_context if _agent_run_context else None)
             
-            # Start span as child of agent run context
+            # Start span as child of step or agent run context
             self.span = tracer.start_span(
                 f"execute_tool {tool_name}",
                 kind=SpanKind.INTERNAL,
