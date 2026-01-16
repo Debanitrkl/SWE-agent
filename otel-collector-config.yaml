@@ -16,13 +16,12 @@ processors:
 
 exporters:
   otlphttp/parseable:
-    endpoint: http://localhost:8000
+    endpoint: https://1fb2bb88-48a3-44d0-8b4d-d2c266aff3b1-ingestor.workspace-staging.parseable.com
+    encoding: json
     headers:
-      Authorization: Basic YWRtaW46YWRtaW4=
+      Authorization: Basic ZGViYWJyYXRhQHBhcnNlYWJsZS5jb206UEJzTjFMSWpXZklpaXJqNg==
       X-P-Stream: swe-agent-traces
-      X-P-Log-Source: otel-traces
-    tls:
-      insecure: true
+      x-p-log-source: otel-traces
 
   # Debug exporter for local development
   debug:
