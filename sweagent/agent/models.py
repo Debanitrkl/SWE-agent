@@ -719,7 +719,11 @@ class LiteLLMModel(AbstractModel):
         # Start OpenTelemetry span for LLM call
         tracer = get_tracer()
         span = None
+        span_token = None
         if tracer is not None:
+            from opentelemetry import context as otel_context
+            from opentelemetry.trace import set_span_in_context
+            
             span = tracer.start_span(
                 f"chat {self.config.name}",
                 kind=SpanKind.CLIENT
@@ -731,6 +735,10 @@ class LiteLLMModel(AbstractModel):
             span.set_attribute("gen_ai.conversation.id", get_conversation_id())
             if self.config.top_p is not None:
                 span.set_attribute("gen_ai.request.top_p", self.config.top_p)
+            
+            # Attach span to context so it becomes the current span
+            ctx = set_span_in_context(span)
+            span_token = otel_context.attach(ctx)
         
         try:
             response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
@@ -749,18 +757,24 @@ class LiteLLMModel(AbstractModel):
             if span:
                 span.set_attribute("error.type", "ContextWindowExceededError")
                 span.set_status(Status(StatusCode.ERROR, str(e)))
+                if span_token is not None:
+                    otel_context.detach(span_token)
                 span.end()
             raise ContextWindowExceededError from e
         except litellm.exceptions.ContentPolicyViolationError as e:
             if span:
                 span.set_attribute("error.type", "ContentPolicyViolationError")
                 span.set_status(Status(StatusCode.ERROR, str(e)))
+                if span_token is not None:
+                    otel_context.detach(span_token)
                 span.end()
             raise ContentPolicyViolationError from e
         except litellm.exceptions.BadRequestError as e:
             if span:
                 span.set_attribute("error.type", "BadRequestError")
                 span.set_status(Status(StatusCode.ERROR, str(e)))
+                if span_token is not None:
+                    otel_context.detach(span_token)
                 span.end()
             if "is longer than the model's context length" in str(e):
                 raise ContextWindowExceededError from e
@@ -770,6 +784,8 @@ class LiteLLMModel(AbstractModel):
                 span.set_attribute("error.type", type(e).__name__)
                 span.set_status(Status(StatusCode.ERROR, str(e)))
                 span.record_exception(e)
+                if span_token is not None:
+                    otel_context.detach(span_token)
                 span.end()
             raise
             
@@ -786,6 +802,8 @@ class LiteLLMModel(AbstractModel):
                 )
                 self.logger.error(msg)
                 if span:
+                    if span_token is not None:
+                        otel_context.detach(span_token)
                     span.end()
                 raise ModelConfigurationError(msg)
             cost = 0
@@ -826,6 +844,8 @@ class LiteLLMModel(AbstractModel):
             if finish_reasons:
                 span.set_attribute("gen_ai.response.finish_reasons", str(finish_reasons))
             span.set_status(Status(StatusCode.OK))
+            if span_token is not None:
+                otel_context.detach(span_token)
             span.end()
             
             # Update global agent run token counts

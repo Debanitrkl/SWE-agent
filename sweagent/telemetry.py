@@ -18,21 +18,24 @@ from typing import Any, Callable
 TRACING_ENABLED = os.getenv("SWE_AGENT_ENABLE_TRACING", "false").lower() == "true"
 
 if TRACING_ENABLED:
-    from opentelemetry import trace
+    from opentelemetry import trace, context
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.resources import Resource, SERVICE_NAME
-    from opentelemetry.trace import Status, StatusCode, SpanKind
+    from opentelemetry.trace import Status, StatusCode, SpanKind, set_span_in_context
 else:
     trace = None
+    context = None
     SpanKind = None
     Status = None
     StatusCode = None
+    set_span_in_context = None
 
 
 _tracer = None
 _conversation_id = None
+_agent_run_context = None  # Store the context with the agent run span
 
 
 def setup_telemetry(service_name: str = "swe-agent") -> None:
@@ -200,12 +203,14 @@ def trace_tool_execution(tool_name: str, tool_call_id: str = None, arguments: di
     class ToolTraceContext:
         def __init__(self):
             self.span = None
+            self.token = None
             
         def __enter__(self):
             tracer = get_tracer()
             if tracer is None:
                 return self
             
+            # Start span as child of current context (which should be the agent run)
             self.span = tracer.start_span(
                 f"execute_tool {tool_name}",
                 kind=SpanKind.INTERNAL
@@ -213,11 +218,16 @@ def trace_tool_execution(tool_name: str, tool_call_id: str = None, arguments: di
             self.span.set_attribute("gen_ai.operation.name", "execute_tool")
             self.span.set_attribute("gen_ai.tool.name", tool_name)
             self.span.set_attribute("gen_ai.tool.type", "function")
+            self.span.set_attribute("gen_ai.conversation.id", get_conversation_id())
             
             if tool_call_id:
                 self.span.set_attribute("gen_ai.tool.call.id", tool_call_id)
             if arguments:
                 self.span.set_attribute("gen_ai.tool.call.arguments", json.dumps(arguments)[:2000])
+            
+            # Set this span as current so any nested operations are children
+            ctx = set_span_in_context(self.span)
+            self.token = context.attach(ctx)
             
             return self
         
@@ -237,6 +247,9 @@ def trace_tool_execution(tool_name: str, tool_call_id: str = None, arguments: di
                     self.span.set_status(Status(StatusCode.OK))
                 else:
                     self.set_error(exc_val)
+                # Detach context before ending span
+                if self.token is not None:
+                    context.detach(self.token)
                 self.span.end()
             return False
     
@@ -256,11 +269,14 @@ class AgentRunTrace:
         self.problem_id = problem_id
         self.model_name = model_name
         self.span = None
+        self.ctx = None
+        self.token = None
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.iterations = 0
     
     def __enter__(self):
+        global _agent_run_context
         tracer = get_tracer()
         if tracer is None:
             return self
@@ -282,6 +298,11 @@ class AgentRunTrace:
         if self.model_name:
             self.span.set_attribute("gen_ai.request.model", self.model_name)
         
+        # Set this span as the current context so child spans are nested
+        self.ctx = set_span_in_context(self.span)
+        self.token = context.attach(self.ctx)
+        _agent_run_context = self.ctx
+        
         return self
     
     def add_tokens(self, input_tokens: int, output_tokens: int):
@@ -301,6 +322,7 @@ class AgentRunTrace:
                 self.span.set_attribute("agent.has_submission", True)
     
     def __exit__(self, exc_type, exc_val, exc_tb):
+        global _agent_run_context
         if self.span:
             if exc_type is None:
                 self.span.set_status(Status(StatusCode.OK))
@@ -308,12 +330,22 @@ class AgentRunTrace:
                 self.span.set_attribute("error.type", exc_type.__name__)
                 self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
                 self.span.record_exception(exc_val)
+            
+            # Detach the context before ending the span
+            if self.token is not None:
+                context.detach(self.token)
+            _agent_run_context = None
             self.span.end()
         return False
 
 
 # Global agent run trace for tracking across the codebase
 _current_agent_run: AgentRunTrace = None
+
+
+def get_agent_run_context():
+    """Get the current agent run context for creating child spans."""
+    return _agent_run_context
 
 
 def start_agent_run(agent_name: str = "SWE-agent", problem_id: str = None, model_name: str = None) -> AgentRunTrace:
