@@ -1315,17 +1315,36 @@ class DefaultAgent(AbstractAgent):
         """
         self.setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
 
+        # Start OpenTelemetry trace for agent run
+        problem_id = getattr(problem_statement, 'id', None) or str(problem_statement)[:100]
+        model_name = getattr(self.model.config, 'name', None) if self.model else None
+        agent_run_trace = start_agent_run(
+            agent_name="SWE-agent",
+            problem_id=problem_id,
+            model_name=model_name
+        )
+
         # Run action/observation loop
         self._chook.on_run_start()
         step_output = StepOutput()
-        while not step_output.done:
-            step_output = self.step()
-            self.save_trajectory()
-        self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
+        try:
+            while not step_output.done:
+                step_output = self.step()
+                self.save_trajectory()
+            self._chook.on_run_done(trajectory=self.trajectory, info=self.info)
 
-        self.logger.info("Trajectory saved to %s", self.traj_path)
+            self.logger.info("Trajectory saved to %s", self.traj_path)
 
-        # Here we want to return the "global" information (e.g., submission should
-        # be the best submission instead of the last one, etc.), so we get it from the traj file
-        data = self.get_trajectory_data()
-        return AgentRunResult(info=data["info"], trajectory=data["trajectory"])
+            # Here we want to return the "global" information (e.g., submission should
+            # be the best submission instead of the last one, etc.), so we get it from the traj file
+            data = self.get_trajectory_data()
+            
+            # End agent run trace with success
+            submission = data.get("info", {}).get("submission")
+            end_agent_run(success=bool(submission), submission=submission)
+            
+            return AgentRunResult(info=data["info"], trajectory=data["trajectory"])
+        except Exception as e:
+            # End agent run trace with failure
+            end_agent_run(success=False)
+            raise

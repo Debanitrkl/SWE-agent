@@ -357,6 +357,7 @@ _current_agent_run: AgentRunTrace = None
 
 def get_agent_run_context():
     """Get the current agent run context for creating child spans."""
+    global _agent_run_context
     return _agent_run_context
 
 
