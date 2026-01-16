@@ -1,0 +1,36 @@
+# OpenTelemetry Collector configuration for SWE-agent
+# Forwards traces to Parseable for SQL-powered analysis
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 100
+
+exporters:
+  otlphttp/parseable:
+    endpoint: http://localhost:8000
+    headers:
+      Authorization: Basic YWRtaW46YWRtaW4=
+      X-P-Stream: swe-agent-traces
+      X-P-Log-Source: otel-traces
+    tls:
+      insecure: true
+
+  # Debug exporter for local development
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/parseable, debug]

@@ -55,6 +55,13 @@ from sweagent.utils.config import _convert_paths_to_abspath, _strip_abspath_from
 from sweagent.utils.jinja_warnings import _warn_probably_wrong_jinja_syntax
 from sweagent.utils.log import get_logger
 from sweagent.utils.patch_formatter import PatchFormatter
+from sweagent.telemetry import (
+    get_tracer, get_conversation_id, start_agent_run, end_agent_run,
+    trace_tool_execution, TRACING_ENABLED
+)
+
+if TRACING_ENABLED:
+    from opentelemetry.trace import SpanKind, Status, StatusCode
 
 
 class TemplateConfig(BaseModel):
@@ -405,39 +412,59 @@ class RetryAgent(AbstractAgent):
         self.setup(env=env, problem_statement=problem_statement, output_dir=output_dir)
         assert self._rloop is not None
 
+        # Start OpenTelemetry trace for agent run
+        problem_id = getattr(problem_statement, 'id', None) or str(problem_statement)[:100]
+        model_name = getattr(self._agent.model.config, 'name', None) if self._agent else None
+        agent_run_trace = start_agent_run(
+            agent_name="SWE-agent",
+            problem_id=problem_id,
+            model_name=model_name
+        )
+
         # Run action/observation loop
         self._chook.on_run_start()
         step_output = StepOutput()
         self._setup_agent()
         assert self._agent is not None
-        while not step_output.done:
-            step_output = self.step()
-            self.save_trajectory(choose=False)
-            if step_output.done:
-                self._rloop.on_submit(
-                    ReviewSubmission(
-                        trajectory=self._agent.trajectory,
-                        info=self._agent.info,
-                        model_stats=self._agent.model.stats,
-                    )
-                )
-                if isinstance(self._rloop, ScoreRetryLoop):
-                    self._agent.info["review"] = self._rloop.reviews[-1].model_dump()  # type: ignore
-                self._finalize_agent_run()
+        
+        try:
+            while not step_output.done:
+                step_output = self.step()
                 self.save_trajectory(choose=False)
-                if self._rloop.retry():
-                    assert self._env is not None
-                    self._next_attempt()
-                    step_output.done = False
-        self.save_trajectory(choose=True)  # call again after we finalized
-        self._chook.on_run_done(trajectory=self._agent.trajectory, info=self._agent.info)
+                if step_output.done:
+                    self._rloop.on_submit(
+                        ReviewSubmission(
+                            trajectory=self._agent.trajectory,
+                            info=self._agent.info,
+                            model_stats=self._agent.model.stats,
+                        )
+                    )
+                    if isinstance(self._rloop, ScoreRetryLoop):
+                        self._agent.info["review"] = self._rloop.reviews[-1].model_dump()  # type: ignore
+                    self._finalize_agent_run()
+                    self.save_trajectory(choose=False)
+                    if self._rloop.retry():
+                        assert self._env is not None
+                        self._next_attempt()
+                        step_output.done = False
+            self.save_trajectory(choose=True)  # call again after we finalized
+            self._chook.on_run_done(trajectory=self._agent.trajectory, info=self._agent.info)
 
-        self.logger.info("Trajectory saved to %s", self._traj_path)
+            self.logger.info("Trajectory saved to %s", self._traj_path)
 
-        # Here we want to return the "global" information (e.g., submission should
-        # be the best submission instead of the last one, etc.), so we get it from the traj file
-        data = self.get_trajectory_data(choose=True)
-        return AgentRunResult(info=data["info"], trajectory=data["trajectory"])
+            # Here we want to return the "global" information (e.g., submission should
+            # be the best submission instead of the last one, etc.), so we get it from the traj file
+            data = self.get_trajectory_data(choose=True)
+            
+            # End agent run trace with success
+            submission = data.get("info", {}).get("submission")
+            end_agent_run(success=bool(submission), submission=submission)
+            
+            return AgentRunResult(info=data["info"], trajectory=data["trajectory"])
+        except Exception as e:
+            # End agent run trace with failure
+            end_agent_run(success=False)
+            raise
 
 
 class DefaultAgent(AbstractAgent):
@@ -959,34 +986,44 @@ class DefaultAgent(AbstractAgent):
         self._chook.on_action_started(step=step)
         execution_t0 = time.perf_counter()
         run_action: str = self.tools.guard_multiline_input(step.action).strip()
-        try:
-            step.observation = self._env.communicate(
-                input=run_action,
-                timeout=self.tools.config.execution_timeout,
-                check="raise" if self._always_require_zero_exit_code else "ignore",
-            )
-        except CommandTimeoutError:
-            self._n_consecutive_timeouts += 1
-            if self._n_consecutive_timeouts >= self.tools.config.max_consecutive_execution_timeouts:
-                msg = "Exiting agent due to too many consecutive execution timeouts"
-                self.logger.critical(msg)
-                step.execution_time = time.perf_counter() - execution_t0
-                self._total_execution_time += step.execution_time
-                raise
+        
+        # Extract tool name from action (first word or command)
+        tool_name = run_action.split()[0] if run_action.split() else "unknown"
+        tool_call_id = f"call_{hash(run_action) % 10000:04d}"
+        
+        # Start OpenTelemetry span for tool execution
+        with trace_tool_execution(tool_name, tool_call_id, {"command": run_action[:500]}) as tool_trace:
             try:
-                self._env.interrupt_session()
-            except Exception as f:
-                self.logger.exception("Failed to interrupt session after command timeout: %s", f, exc_info=True)
-                step.execution_time = time.perf_counter() - execution_t0
-                self._total_execution_time += step.execution_time
-                raise
-            step.observation = Template(self.templates.command_cancelled_timeout_template).render(
-                **self._get_format_dict(),
-                timeout=self.tools.config.execution_timeout,
-                command=run_action,
-            )
-        else:
-            self._n_consecutive_timeouts = 0
+                step.observation = self._env.communicate(
+                    input=run_action,
+                    timeout=self.tools.config.execution_timeout,
+                    check="raise" if self._always_require_zero_exit_code else "ignore",
+                )
+                tool_trace.set_result({"observation": step.observation[:500] if step.observation else ""})
+            except CommandTimeoutError:
+                self._n_consecutive_timeouts += 1
+                tool_trace.set_error(CommandTimeoutError("Command timed out"))
+                if self._n_consecutive_timeouts >= self.tools.config.max_consecutive_execution_timeouts:
+                    msg = "Exiting agent due to too many consecutive execution timeouts"
+                    self.logger.critical(msg)
+                    step.execution_time = time.perf_counter() - execution_t0
+                    self._total_execution_time += step.execution_time
+                    raise
+                try:
+                    self._env.interrupt_session()
+                except Exception as f:
+                    self.logger.exception("Failed to interrupt session after command timeout: %s", f, exc_info=True)
+                    step.execution_time = time.perf_counter() - execution_t0
+                    self._total_execution_time += step.execution_time
+                    raise
+                step.observation = Template(self.templates.command_cancelled_timeout_template).render(
+                    **self._get_format_dict(),
+                    timeout=self.tools.config.execution_timeout,
+                    command=run_action,
+                )
+            else:
+                self._n_consecutive_timeouts = 0
+                
         step.execution_time = time.perf_counter() - execution_t0
         self._total_execution_time += step.execution_time
         self._chook.on_action_executed(step=step)

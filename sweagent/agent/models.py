@@ -39,6 +39,10 @@ from sweagent.exceptions import (
 from sweagent.tools.tools import ToolConfig
 from sweagent.types import History, HistoryItem
 from sweagent.utils.log import get_logger
+from sweagent.telemetry import get_tracer, get_conversation_id, get_current_agent_run, TRACING_ENABLED
+
+if TRACING_ENABLED:
+    from opentelemetry.trace import SpanKind, Status, StatusCode
 
 try:
     import readline  # noqa: F401
@@ -711,6 +715,23 @@ class LiteLLMModel(AbstractModel):
         completion_kwargs = self.config.completion_kwargs
         if self.lm_provider == "anthropic":
             completion_kwargs["max_tokens"] = self.model_max_output_tokens
+        
+        # Start OpenTelemetry span for LLM call
+        tracer = get_tracer()
+        span = None
+        if tracer is not None:
+            span = tracer.start_span(
+                f"chat {self.config.name}",
+                kind=SpanKind.CLIENT
+            )
+            span.set_attribute("gen_ai.operation.name", "chat")
+            span.set_attribute("gen_ai.provider.name", self.lm_provider)
+            span.set_attribute("gen_ai.request.model", self.config.name)
+            span.set_attribute("gen_ai.request.temperature", self.config.temperature if temperature is None else temperature)
+            span.set_attribute("gen_ai.conversation.id", get_conversation_id())
+            if self.config.top_p is not None:
+                span.set_attribute("gen_ai.request.top_p", self.config.top_p)
+        
         try:
             response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
                 model=self.config.name,
@@ -725,13 +746,33 @@ class LiteLLMModel(AbstractModel):
                 n=n,
             )
         except litellm.exceptions.ContextWindowExceededError as e:
+            if span:
+                span.set_attribute("error.type", "ContextWindowExceededError")
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                span.end()
             raise ContextWindowExceededError from e
         except litellm.exceptions.ContentPolicyViolationError as e:
+            if span:
+                span.set_attribute("error.type", "ContentPolicyViolationError")
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                span.end()
             raise ContentPolicyViolationError from e
         except litellm.exceptions.BadRequestError as e:
+            if span:
+                span.set_attribute("error.type", "BadRequestError")
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                span.end()
             if "is longer than the model's context length" in str(e):
                 raise ContextWindowExceededError from e
             raise
+        except Exception as e:
+            if span:
+                span.set_attribute("error.type", type(e).__name__)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+                span.record_exception(e)
+                span.end()
+            raise
+            
         self.logger.debug(f"Response: {response}")
         try:
             cost = litellm.cost_calculator.completion_cost(response, model=self.config.name)
@@ -744,6 +785,8 @@ class LiteLLMModel(AbstractModel):
                     "`total_cost_limit` to 0 to disable this safety check."
                 )
                 self.logger.error(msg)
+                if span:
+                    span.end()
                 raise ModelConfigurationError(msg)
             cost = 0
         choices: litellm.types.utils.Choices = response.choices  # type: ignore
@@ -771,6 +814,25 @@ class LiteLLMModel(AbstractModel):
                 output_dict["thinking_blocks"] = response.choices[i].message.thinking_blocks  # type: ignore
             outputs.append(output_dict)
         self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost)
+        
+        # Complete the span with token usage and response info
+        if span:
+            span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+            span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+            span.set_attribute("gen_ai.response.model", getattr(response, 'model', self.config.name))
+            if hasattr(response, 'id'):
+                span.set_attribute("gen_ai.response.id", response.id)
+            finish_reasons = [choices[i].finish_reason for i in range(n_choices) if hasattr(choices[i], 'finish_reason')]
+            if finish_reasons:
+                span.set_attribute("gen_ai.response.finish_reasons", str(finish_reasons))
+            span.set_status(Status(StatusCode.OK))
+            span.end()
+            
+            # Update global agent run token counts
+            agent_run = get_current_agent_run()
+            if agent_run:
+                agent_run.add_tokens(input_tokens, output_tokens)
+        
         return outputs
 
     def _query(
